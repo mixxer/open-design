@@ -2,9 +2,20 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createJsonIpcServer, type JsonIpcServerHandle } from "@open-design/sidecar";
-import { SIDECAR_ENV, SIDECAR_MESSAGES } from "@open-design/sidecar-proto";
+import { createJsonIpcServer, resolveAppIpcPath, type JsonIpcServerHandle } from "@open-design/sidecar";
+import { releaseNamespace, type ReleasePlatform } from "@open-design/release";
+import {
+  APP_KEYS,
+  OPEN_DESIGN_SIDECAR_CONTRACT,
+  SIDECAR_ENV,
+  SIDECAR_MESSAGES,
+} from "@open-design/sidecar-proto";
 import { resolveDaemonUrl, DEFAULT_DAEMON_URL } from "../src/daemon-url.js";
+
+const CURRENT_RELEASE_PLATFORM: ReleasePlatform =
+  process.platform === "darwin"
+    ? process.arch === "arm64" ? "mac" : "macIntel"
+    : process.platform === "win32" ? "win" : "linux";
 
 // Verifies the resolution chain: --daemon-url > OD_DAEMON_URL > sidecar
 // IPC status discovery > legacy default. Each layer must short-circuit the next
@@ -119,5 +130,202 @@ describe("resolveDaemonUrl", () => {
     } finally {
       await ipc?.close();
     }
+  });
+
+  // Regression coverage for #6424: a plain terminal invocation of `od mcp
+  // install <agent>` never has OD_SIDECAR_IPC_PATH set (only the packaged
+  // app's own spawned children get it), so it previously had no way to find
+  // a packaged install's daemon and always degraded to a broken bare-`od`
+  // launch spec. `allowConventionalIpcDiscovery` is opt-in specifically so
+  // this new discovery path cannot change behavior for every OTHER `od`
+  // subcommand that already worked correctly without it.
+  describe("conventional per-channel IPC discovery (#6424)", () => {
+    let conventionalIpcBaseDir: string;
+
+    beforeAll(() => {
+      conventionalIpcBaseDir = fs.mkdtempSync(path.join(os.tmpdir(), "od-conventional-ipc-"));
+    });
+
+    afterAll(() => {
+      fs.rmSync(conventionalIpcBaseDir, { recursive: true, force: true });
+    });
+
+    it("ignores a live conventional-path socket by default (allowConventionalIpcDiscovery unset)", async () => {
+      const socketPath = resolveAppIpcPath({
+        app: APP_KEYS.DAEMON,
+        contract: OPEN_DESIGN_SIDECAR_CONTRACT,
+        env: { [SIDECAR_ENV.IPC_BASE]: conventionalIpcBaseDir },
+        namespace: releaseNamespace("stable", CURRENT_RELEASE_PLATFORM),
+      });
+      fs.mkdirSync(path.dirname(socketPath), { recursive: true });
+      let ipc: JsonIpcServerHandle | null = null;
+      try {
+        ipc = await createJsonIpcServer({
+          socketPath,
+          handler: () => ({ pid: 1, state: "running", updatedAt: new Date().toISOString(), url: "http://127.0.0.1:59999" }),
+        });
+
+        const url = await resolveDaemonUrl({
+          env: {
+            PATH: emptyBinDir,
+            [SIDECAR_ENV.IPC_BASE]: conventionalIpcBaseDir,
+          },
+          timeoutMs: 300,
+        });
+        expect(url).toBe(DEFAULT_DAEMON_URL);
+      } finally {
+        await ipc?.close();
+      }
+    });
+
+    it("discovers the live daemon via a conventional per-channel socket when allowConventionalIpcDiscovery is true", async () => {
+      const socketPath = resolveAppIpcPath({
+        app: APP_KEYS.DAEMON,
+        contract: OPEN_DESIGN_SIDECAR_CONTRACT,
+        env: { [SIDECAR_ENV.IPC_BASE]: conventionalIpcBaseDir },
+        namespace: releaseNamespace("stable", CURRENT_RELEASE_PLATFORM),
+      });
+      fs.mkdirSync(path.dirname(socketPath), { recursive: true });
+      let ipc: JsonIpcServerHandle | null = null;
+      try {
+        ipc = await createJsonIpcServer({
+          socketPath,
+          handler: () => ({ pid: 1, state: "running", updatedAt: new Date().toISOString(), url: "http://127.0.0.1:59999" }),
+        });
+
+        const url = await resolveDaemonUrl({
+          env: {
+            [SIDECAR_ENV.IPC_BASE]: conventionalIpcBaseDir,
+          },
+          timeoutMs: 1000,
+          allowConventionalIpcDiscovery: true,
+        });
+        expect(url).toBe("http://127.0.0.1:59999");
+      } finally {
+        await ipc?.close();
+      }
+    });
+
+    it("honors an explicit OD_SIDECAR_NAMESPACE over the channel sweep", async () => {
+      const socketPath = resolveAppIpcPath({
+        app: APP_KEYS.DAEMON,
+        contract: OPEN_DESIGN_SIDECAR_CONTRACT,
+        env: { [SIDECAR_ENV.IPC_BASE]: conventionalIpcBaseDir },
+        namespace: "custom-namespace",
+      });
+      fs.mkdirSync(path.dirname(socketPath), { recursive: true });
+      let ipc: JsonIpcServerHandle | null = null;
+      try {
+        ipc = await createJsonIpcServer({
+          socketPath,
+          handler: () => ({ pid: 1, state: "running", updatedAt: new Date().toISOString(), url: "http://127.0.0.1:58888" }),
+        });
+
+        const url = await resolveDaemonUrl({
+          env: {
+            [SIDECAR_ENV.IPC_BASE]: conventionalIpcBaseDir,
+            [SIDECAR_ENV.NAMESPACE]: "custom-namespace",
+          },
+          timeoutMs: 1000,
+          allowConventionalIpcDiscovery: true,
+        });
+        expect(url).toBe("http://127.0.0.1:58888");
+      } finally {
+        await ipc?.close();
+      }
+    });
+
+    // The JSON-IPC protocol has no responder-identity check (no
+    // peer-credential/uid verification, no shared secret): a STATUS
+    // response is not proof the daemon is who it claims to be. Probing a
+    // predictable, well-known socket path is a wider trust surface than the
+    // pre-existing explicit-OD_SIDECAR_IPC_PATH case, since another local
+    // process could in principle occupy that path first. This is not fixed
+    // here (that needs protocol-level authentication, which is out of scope
+    // for this fix) — but discovery must at least refuse to redirect
+    // off-host, since the caller persists whatever `command`/`args` come
+    // back from `/api/mcp/install-info` at the returned URL into a coding
+    // agent's config.
+    it("rejects a conventional-path response whose url is not loopback", async () => {
+      const socketPath = resolveAppIpcPath({
+        app: APP_KEYS.DAEMON,
+        contract: OPEN_DESIGN_SIDECAR_CONTRACT,
+        env: { [SIDECAR_ENV.IPC_BASE]: conventionalIpcBaseDir },
+        namespace: releaseNamespace("stable", CURRENT_RELEASE_PLATFORM),
+      });
+      fs.mkdirSync(path.dirname(socketPath), { recursive: true });
+      let ipc: JsonIpcServerHandle | null = null;
+      try {
+        ipc = await createJsonIpcServer({
+          socketPath,
+          handler: () => ({ pid: 1, state: "running", updatedAt: new Date().toISOString(), url: "http://evil.example:1234" }),
+        });
+
+        const url = await resolveDaemonUrl({
+          env: {
+            PATH: emptyBinDir,
+            [SIDECAR_ENV.IPC_BASE]: conventionalIpcBaseDir,
+          },
+          timeoutMs: 300,
+          allowConventionalIpcDiscovery: true,
+        });
+        expect(url).toBe(DEFAULT_DAEMON_URL);
+      } finally {
+        await ipc?.close();
+      }
+    });
+
+    // Locks in the channel-precedence contract: when more than one release
+    // channel's daemon happens to be live at once, the stable channel's
+    // response wins deterministically, never whichever socket happens to
+    // answer first. `Promise.allSettled` + ordered result scan (not
+    // `Promise.any`/a bare race) is load-bearing for this — a naive race
+    // would make the outcome depend on scheduling.
+    it("prefers the stable channel when multiple channel sockets are simultaneously live", async () => {
+      const stableSocketPath = resolveAppIpcPath({
+        app: APP_KEYS.DAEMON,
+        contract: OPEN_DESIGN_SIDECAR_CONTRACT,
+        env: { [SIDECAR_ENV.IPC_BASE]: conventionalIpcBaseDir },
+        namespace: releaseNamespace("stable", CURRENT_RELEASE_PLATFORM),
+      });
+      const betaSocketPath = resolveAppIpcPath({
+        app: APP_KEYS.DAEMON,
+        contract: OPEN_DESIGN_SIDECAR_CONTRACT,
+        env: { [SIDECAR_ENV.IPC_BASE]: conventionalIpcBaseDir },
+        namespace: releaseNamespace("beta", CURRENT_RELEASE_PLATFORM),
+      });
+      fs.mkdirSync(path.dirname(stableSocketPath), { recursive: true });
+      fs.mkdirSync(path.dirname(betaSocketPath), { recursive: true });
+      let stableIpc: JsonIpcServerHandle | null = null;
+      let betaIpc: JsonIpcServerHandle | null = null;
+      try {
+        // Beta answers immediately; stable answers slightly slower — if the
+        // implementation ever regresses to a bare race, this ordering would
+        // flip the result to beta and fail the assertion below.
+        betaIpc = await createJsonIpcServer({
+          socketPath: betaSocketPath,
+          handler: () => ({ pid: 2, state: "running", updatedAt: new Date().toISOString(), url: "http://127.0.0.1:57777" }),
+        });
+        stableIpc = await createJsonIpcServer({
+          socketPath: stableSocketPath,
+          handler: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            return { pid: 1, state: "running", updatedAt: new Date().toISOString(), url: "http://127.0.0.1:56666" };
+          },
+        });
+
+        const url = await resolveDaemonUrl({
+          env: {
+            [SIDECAR_ENV.IPC_BASE]: conventionalIpcBaseDir,
+          },
+          timeoutMs: 1000,
+          allowConventionalIpcDiscovery: true,
+        });
+        expect(url).toBe("http://127.0.0.1:56666");
+      } finally {
+        await stableIpc?.close();
+        await betaIpc?.close();
+      }
+    });
   });
 });
