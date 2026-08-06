@@ -14,7 +14,7 @@ import { BRAND_USAGE, isBrandHelpArg } from './cli-help/index.js';
 import { parseDesignSystemRenameArgs } from './design-systems/rename-args.js';
 import { runLiveArtifactsToolCli } from './tools-live-artifacts-cli.js';
 import { splitResearchSubcommand } from './research/cli-args.js';
-import { resolveDaemonUrl } from './daemon-url.js';
+import { resolveDaemonUrl, resolveDaemonUrlDetailed } from './daemon-url.js';
 import { requestJsonIpc } from '@open-design/sidecar';
 import { SIDECAR_ENV, SIDECAR_MESSAGES } from '@open-design/sidecar-proto';
 import { EXPORT_FORMATS, EXPORT_IMAGE_FORMATS } from '@open-design/contracts';
@@ -1980,22 +1980,42 @@ To register this server into a coding agent's own config automatically:
 // <agent>` against a packaged install has no other way to find the running
 // daemon, since OD_SIDECAR_IPC_PATH is only ever stamped into the packaged
 // app's own spawned children. See issue #6424.
+//
+// Uses resolveDaemonUrlDetailed(), not the plain-string resolveDaemonUrl(),
+// specifically because this function is about to fetch AND PERSIST whatever
+// comes back at the resolved URL. When discovery is ambiguous (more than
+// one packaged channel simultaneously live, see daemon-url.ts), the
+// resolved URL is the legacy default port — but that port is not
+// necessarily inert: something could coincidentally be listening there
+// during this exact call (a leftover process, an unrelated local service,
+// even one of the very channels this refused to choose between), and
+// fetching it anyway would silently persist whatever it returns despite the
+// ambiguity guard existing precisely to prevent that. See the #6425 review
+// discussion for the reproduction. Skipping the fetch entirely when
+// `ambiguous` is true and falling straight through to the self-reinvocation
+// spec below is the only way to make "refuse to guess" actually hold.
 async function resolveMcpLaunchSpec(flags) {
-  const base = await cliDaemonBaseUrl(flags, { allowConventionalIpcDiscovery: true });
-  try {
-    const resp = await fetch(`${base}/api/mcp/install-info`);
-    if (resp.ok) {
-      const info = await resp.json();
-      if (info && typeof info.command === 'string' && Array.isArray(info.args)) {
-        return {
-          command: info.command,
-          args: info.args,
-          env: info.env && typeof info.env === 'object' ? info.env : {},
-        };
+  const { url: rawBase, ambiguous } = await resolveDaemonUrlDetailed({
+    flagUrl: flags?.['daemon-url'],
+    allowConventionalIpcDiscovery: true,
+  });
+  const base = rawBase.replace(/\/$/, '');
+  if (!ambiguous) {
+    try {
+      const resp = await fetch(`${base}/api/mcp/install-info`);
+      if (resp.ok) {
+        const info = await resp.json();
+        if (info && typeof info.command === 'string' && Array.isArray(info.args)) {
+          return {
+            command: info.command,
+            args: info.args,
+            env: info.env && typeof info.env === 'object' ? info.env : {},
+          };
+        }
       }
+    } catch {
+      // daemon not running / unreachable — fall through to the minimal spec
     }
-  } catch {
-    // daemon not running / unreachable — fall through to the minimal spec
   }
   // Bare `od` collides with the system octal-dump utility on macOS/Linux
   // (issue #5120). Self-reinvoke via the absolute interpreter + entry-point
