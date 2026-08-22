@@ -17,7 +17,6 @@ import {
 import {
   containsPath,
   createError,
-  directoryIsEmpty,
   isRecord,
   readJson,
   stringField,
@@ -152,6 +151,19 @@ export function isAllowedRootEntry(layout: DesktopUpdaterStoreLayout, name: stri
   return rootEntriesForLayout(layout).has(name);
 }
 
+/**
+ * Filesystem-browser artifacts the OS drops into any directory it renders,
+ * independent of anything the updater does. Their mere presence must never
+ * be treated as store corruption: Finder writes .DS_Store the moment the
+ * update root is viewed even once, and Explorer does the same with
+ * Thumbs.db/desktop.ini.
+ */
+const OS_MANAGED_ROOT_ARTIFACTS = new Set([".DS_Store", "Thumbs.db", "desktop.ini", ".localized"]);
+
+export function isOsManagedRootArtifact(name: string): boolean {
+  return OS_MANAGED_ROOT_ARTIFACTS.has(name);
+}
+
 export function isUpdateStoreMetadata(value: unknown): value is UpdateStoreMetadata {
   if (!isRecord(value) || value.version !== STORE_METADATA_VERSION) return false;
   if (value.active != null && !isUpdateReleaseRef(value.active)) return false;
@@ -250,7 +262,9 @@ export async function ensureOwnedUpdateRoot(
         };
       }
     } else {
-      if (!(await directoryIsEmpty(realRoot))) {
+      const preClaimEntries = await readdir(realRoot);
+      const preClaimContent = preClaimEntries.filter((entry) => !isOsManagedRootArtifact(entry));
+      if (preClaimContent.length > 0) {
         return {
           ok: false,
           error: createError(
@@ -268,7 +282,9 @@ export async function ensureOwnedUpdateRoot(
     }
 
     const entries = await readdir(realRoot);
-    const unexpected = entries.filter((entry) => !isAllowedRootEntry(layout, entry));
+    const unexpected = entries.filter(
+      (entry) => !isAllowedRootEntry(layout, entry) && !isOsManagedRootArtifact(entry),
+    );
     if (unexpected.length > 0) {
       const error = storeShapeError(realRoot, "update store contains unexpected root entries", { unexpected });
       logStoreError(logger, error);
@@ -299,7 +315,9 @@ export async function ensureOwnedUpdateRoot(
     try {
       await access(layout.metadataPath);
     } catch {
-      const nonSentinelEntries = entries.filter((entry) => entry !== OWNERSHIP_SENTINEL);
+      const nonSentinelEntries = entries.filter(
+        (entry) => entry !== OWNERSHIP_SENTINEL && !isOsManagedRootArtifact(entry),
+      );
       if (nonSentinelEntries.length > 0) {
         const error = storeShapeError(realRoot, "update store metadata.json is missing for a non-empty store", {
           entries: nonSentinelEntries,
