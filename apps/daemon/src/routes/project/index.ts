@@ -838,6 +838,7 @@ export const URL_PREVIEW_SELECTION_BRIDGE = `<script data-od-url-selection-bridg
   // arrived before the child finished mounting or reloaded afterward.
   var pendingFrameInspectOverrides = Object.create(null);
   var STATIC_FRAME_PATHS = [];
+  var RENDER_NONCE = "";
   var inspectStyle = null;
   var ALLOWED_INSPECT_PROPS = {
     'color': true, 'background-color': true, 'font-size': true,
@@ -937,6 +938,20 @@ export const URL_PREVIEW_SELECTION_BRIDGE = `<script data-od-url-selection-bridg
   // narrower than project-wide file authorization; do not add timing heuristics.
   var originalFrameIsStatic = new WeakMap();
   var originalFramePaths = new WeakMap();
+  var projectFrameLoadListeners = new WeakSet();
+  function clearLiveFramePath(frame){
+    try { liveFramePaths.delete(frame); } catch (_) {}
+    try {
+      if (originalFrameIsStatic.get(frame)) {
+        window.parent.postMessage({ type: 'od:project-frame-live-path-cleared', originalPath: originalFramePaths.get(frame), nonce: RENDER_NONCE }, '*');
+      }
+    } catch (_) {}
+  }
+  function observeProjectFrameLoad(frame){
+    if (!frame || projectFrameLoadListeners.has(frame)) return;
+    projectFrameLoadListeners.add(frame);
+    frame.addEventListener('load', function(){ clearLiveFramePath(frame); });
+  }
   function projectFramePath(frame){
     // A validated ready ping (see od:url-selection-bridge-ready below)
     // caches the child's own reported path here -- ground truth from the
@@ -948,6 +963,7 @@ export const URL_PREVIEW_SELECTION_BRIDGE = `<script data-od-url-selection-bridg
       if (frame && !originalFramePaths.has(frame)) {
         originalFramePaths.set(frame, srcDerivedPath);
         originalFrameIsStatic.set(frame, !!srcDerivedPath && STATIC_FRAME_PATHS.indexOf(srcDerivedPath) !== -1);
+        observeProjectFrameLoad(frame);
       }
       var cachedFramePath = frame && liveFramePaths.get(frame);
       var currentFrameSrc = frame && frame.getAttribute ? (frame.getAttribute('src') || '') : '';
@@ -1577,7 +1593,7 @@ export const URL_PREVIEW_SELECTION_BRIDGE = `<script data-od-url-selection-bridg
       } catch (_) {}
       try {
         if (originalFrameIsStatic.get(readyFrame)) {
-          window.parent.postMessage({ type: 'od:project-frame-live-path', originalPath: originalFramePaths.get(readyFrame), newPath: readyFramePath }, '*');
+          window.parent.postMessage({ type: 'od:project-frame-live-path', originalPath: originalFramePaths.get(readyFrame), newPath: readyFramePath, nonce: RENDER_NONCE }, '*');
         }
       } catch (_) {}
       try { ev.source.postMessage({ type: 'od:comment-mode', enabled: commentEnabled, mode: mode }, '*'); } catch (_) {}
@@ -1815,9 +1831,15 @@ export const URL_PREVIEW_SELECTION_BRIDGE = `<script data-od-url-selection-bridg
 })();
 </script>`;
 
-export function buildUrlPreviewSelectionBridge(staticFramePaths: readonly string[] = []): string {
+export function buildUrlPreviewSelectionBridge(
+  staticFramePaths: readonly string[] = [],
+  renderNonce = '',
+): string {
   const paths = JSON.stringify([...staticFramePaths]).replace(/</g, '\\u003c');
-  return URL_PREVIEW_SELECTION_BRIDGE.replace('var STATIC_FRAME_PATHS = [];', `var STATIC_FRAME_PATHS = ${paths};`);
+  const nonce = JSON.stringify(renderNonce).replace(/</g, '\\u003c');
+  return URL_PREVIEW_SELECTION_BRIDGE
+    .replace('var STATIC_FRAME_PATHS = [];', `var STATIC_FRAME_PATHS = ${paths};`)
+    .replace('var RENDER_NONCE = "";', `var RENDER_NONCE = ${nonce};`);
 }
 
 function staticProjectFramePaths(source: string, rootFilePath: string): string[] {
@@ -2139,6 +2161,7 @@ function injectUrlPreviewBridge(
     | 'focus'
     | 'redirect',
   rootFilePath = '',
+  renderNonce = '',
 ): string {
   if (bridge === 'sandbox') {
     return injectAfterHeadOpen(html, 'data-od-sandbox-shim', buildPreviewSandboxShim());
@@ -2175,7 +2198,7 @@ function injectUrlPreviewBridge(
     return injectBeforeBodyClose(html, 'data-od-url-scroll-bridge', URL_PREVIEW_SCROLL_BRIDGE);
   }
   if (bridge === 'selection') {
-    return injectBeforeBodyClose(html, 'data-od-url-selection-bridge', buildUrlPreviewSelectionBridge(staticProjectFramePaths(html, rootFilePath)));
+    return injectBeforeBodyClose(html, 'data-od-url-selection-bridge', buildUrlPreviewSelectionBridge(staticProjectFramePaths(html, rootFilePath), renderNonce));
   }
   return injectBeforeBodyClose(html, 'data-od-url-snapshot-bridge', URL_PREVIEW_SNAPSHOT_BRIDGE);
 }
@@ -2185,6 +2208,7 @@ function applyUrlPreviewBridgesToHtml(
   mime: string,
   requestedBridge: unknown,
   rootFilePath = '',
+  renderNonce = '',
 ): string | Buffer {
   if (
     !(
@@ -2229,7 +2253,7 @@ function applyUrlPreviewBridgesToHtml(
     html = injectUrlPreviewBridge(html, 'scroll', rootFilePath);
   }
   if (wantsUrlPreviewSelectionBridge(requestedBridge)) {
-    html = injectUrlPreviewBridge(html, 'selection', rootFilePath);
+    html = injectUrlPreviewBridge(html, 'selection', rootFilePath, renderNonce);
   }
   if (wantsUrlPreviewSnapshotBridge(requestedBridge)) {
     html = injectUrlPreviewBridge(html, 'snapshot', rootFilePath);
@@ -7421,6 +7445,7 @@ export function registerProjectFileRoutes(app: Express, ctx: RegisterProjectFile
             file.mime,
             req.query.odPreviewBridge,
             relPath,
+            typeof req.query.odRenderNonce === 'string' ? req.query.odRenderNonce : '',
           );
           const workspaceId = typeof req.query.workspaceId === 'string'
             ? req.query.workspaceId
@@ -7534,7 +7559,13 @@ export function registerProjectFileRoutes(app: Express, ctx: RegisterProjectFile
             projectsRoot: PROJECTS_DIR,
             readProjectFile,
           });
-          return applyUrlPreviewBridgesToHtml(transformed, file.mime, req.query.odPreviewBridge, relPath);
+          return applyUrlPreviewBridgesToHtml(
+            transformed,
+            file.mime,
+            req.query.odPreviewBridge,
+            relPath,
+            typeof req.query.odRenderNonce === 'string' ? req.query.odRenderNonce : '',
+          );
         },
       );
     } catch (err: any) {
