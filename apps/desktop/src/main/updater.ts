@@ -821,7 +821,7 @@ export function createDesktopUpdater(
         ...current,
         lastCheckedAt,
       }));
-      if (!metadataPatch.ok) return metadataPatch.status;
+      if (!metadataPatch.ok) return observeCheck(metadataPatch.status);
       scheduleBackCleanup(metadataPatch.root.realRoot, logger);
       const launcherPayloadContextValid = await hasValidLauncherPayloadContext(config);
       const installedOuterVersion = launcherPayloadContextValid ? await resolveInstalledOuterVersion(config) : null;
