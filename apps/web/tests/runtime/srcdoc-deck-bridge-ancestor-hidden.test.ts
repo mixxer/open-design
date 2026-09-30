@@ -1,6 +1,6 @@
 // @vitest-environment node
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { JSDOM } from 'jsdom';
 import { buildSrcdoc } from '../../src/runtime/srcdoc';
 
@@ -30,9 +30,10 @@ function extractDeckBridgeScript(srcdoc: string): string {
   return match[1];
 }
 
-function setupDeckBridge(bodyHtml: string) {
+function setupDeckBridge(bodyHtml: string, initialSlideIndex = 0) {
   const srcdoc = buildSrcdoc(`<!doctype html><html><body>${bodyHtml}</body></html>`, {
     deck: true,
+    initialSlideIndex,
   });
   const script = extractDeckBridgeScript(srcdoc);
   const dom = new JSDOM(`<!doctype html><html><body>${bodyHtml}</body></html>`, {
@@ -40,6 +41,11 @@ function setupDeckBridge(bodyHtml: string) {
     pretendToBeVisual: true,
   });
   const win = dom.window;
+  if (vi.isFakeTimers()) {
+    win.setTimeout = setTimeout as unknown as typeof win.setTimeout;
+    win.clearTimeout = clearTimeout as unknown as typeof win.clearTimeout;
+    win.Date = Date;
+  }
   win.scrollTo = vi.fn() as typeof win.scrollTo;
   const parentPostMessage = vi.fn();
   // jsdom defaults `window.parent` to `window` itself for top-level
@@ -86,6 +92,68 @@ function revealDeckHtml(presentIndex: number): string {
 }
 
 describe('deck bridge — ancestor-hidden slides (#7604)', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it.each(['keyboard', 'reveal-api'])('restores the thumbnail index after delayed %s initialization', async (runtime) => {
+    vi.useFakeTimers();
+    const { dom, win, parentPostMessage } = setupDeckBridge(revealDeckHtml(0), 2);
+    try {
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(lastSlideState(parentPostMessage)).toMatchObject({ active: 0, count: 3 });
+
+      const sections = Array.from(win.document.querySelectorAll('.slides > section'));
+      let active = 0;
+      const show = (index: number) => {
+        active = Math.max(0, Math.min(2, index));
+        sections.forEach((section, index) => section.classList.toggle('present', index === active));
+      };
+      if (runtime === 'keyboard') {
+        win.document.addEventListener('keydown', (event) => {
+          if (event.key === 'ArrowRight') show(active + 1);
+          else if (event.key === 'ArrowLeft') show(active - 1);
+        });
+      } else {
+        Object.assign(win, { Reveal: {
+          isReady: () => true,
+          getIndices: (section: Element) => ({ h: sections.indexOf(section), v: 0 }),
+          slide: show,
+        } });
+      }
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(sections.findIndex((section) => section.classList.contains('present'))).toBe(2);
+      expect(lastSlideState(parentPostMessage)).toMatchObject({ active: 2, count: 3 });
+
+      postSlide(win, 'prev');
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(lastSlideState(parentPostMessage)).toMatchObject({ active: 1, count: 3 });
+    } finally {
+      dom.window.close();
+    }
+  });
+
+  it('cancels pending initial restoration when the host selects the already-visible slide', async () => {
+    vi.useFakeTimers();
+    const { dom, win, parentPostMessage } = setupDeckBridge(revealDeckHtml(0), 2);
+    try {
+      await vi.advanceTimersByTimeAsync(1_000);
+      win.dispatchEvent(new win.MessageEvent('message', {
+        data: { type: 'od:slide', action: 'go', index: 0 },
+      }));
+      const slide = vi.fn();
+      Object.assign(win, { Reveal: {
+        isReady: () => true,
+        getIndices: () => ({ h: 2, v: 0 }),
+        slide,
+      } });
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(slide).not.toHaveBeenCalled();
+      expect(lastSlideState(parentPostMessage)).toMatchObject({ active: 0, count: 3 });
+    } finally {
+      dom.window.close();
+    }
+  });
+
   it('detects the active slide when a reveal.js-style ancestor toggles visibility', async () => {
     const { win, parentPostMessage } = setupDeckBridge(revealDeckHtml(1));
 
@@ -188,4 +256,29 @@ describe('deck bridge — ancestor-hidden slides (#7604)', () => {
 
     expect(lastSlideState(parentPostMessage)).toMatchObject({ active: 1, count: 3 });
   });
+  it('aligns Reveal scroll-view navigation with the target page start', async () => {
+    vi.useFakeTimers();
+    const { win } = setupDeckBridge(revealDeckHtml(0));
+    const sections = Array.from(win.document.querySelectorAll('.slides > section'));
+    const scrollPages = sections.map((section) => {
+      const wrapper = win.document.createElement('div');
+      wrapper.className = 'scroll-page';
+      section.replaceWith(wrapper);
+      wrapper.append(section);
+      wrapper.scrollIntoView = vi.fn();
+      return wrapper;
+    });
+    const slide = vi.fn();
+    Object.assign(win, { Reveal: {
+      isReady: () => true,
+      isScrollView: () => true,
+      getIndices: () => ({ h: 0, v: 0 }),
+      slide,
+    } });
+    win.dispatchEvent(new win.MessageEvent('message', { data: { type: 'od:slide', action: 'go', index: 2 } }));
+    await vi.advanceTimersByTimeAsync(100);
+    expect(scrollPages[2]!.scrollIntoView).toHaveBeenCalledWith({ block: 'start', behavior: 'instant' });
+    expect(slide).not.toHaveBeenCalled();
+  });
+
 });
