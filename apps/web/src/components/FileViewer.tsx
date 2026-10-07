@@ -6097,6 +6097,23 @@ function CommentPreviewOverlays({
   );
 }
 
+function preserveCommentClickPoint(
+  current: PreviewCommentSnapshot,
+  updated: PreviewCommentSnapshot,
+): PreviewCommentSnapshot {
+  if (updated.hoverPoint || !current.hoverPoint || current.elementId !== updated.elementId || current.filePath !== updated.filePath) return updated;
+  // Geometry refreshes omit the click point. Keep its relative position in
+  // the selected element as that element moves or resizes.
+  const { position } = current;
+  return {
+    ...updated,
+    hoverPoint: {
+      x: updated.position.x + (current.hoverPoint.x - position.x) * (position.width > 0 ? updated.position.width / position.width : 1),
+      y: updated.position.y + (current.hoverPoint.y - position.y) * (position.height > 0 ? updated.position.height / position.height : 1),
+    },
+  };
+}
+
 function activeCommentPinStyle(
   target: PreviewCommentSnapshot,
   scale: number,
@@ -12605,14 +12622,16 @@ function HtmlViewer({
           if (current.selectionKind === 'pod') return current;
           const updated = next.get(current.elementId);
           if (!updated || !isValidCommentOverlayPosition(updated.position)) return null;
-          return commentSnapshotEqual(current, updated) ? current : updated;
+          const anchored = preserveCommentClickPoint(current, updated);
+          return commentSnapshotEqual(current, anchored) ? current : anchored;
         });
         setHoveredCommentTarget((current) => {
           if (!current) return null;
           if (current.selectionKind === 'pod') return current;
           const updated = next.get(current.elementId);
           if (!updated || !isValidCommentOverlayPosition(updated.position)) return null;
-          return commentSnapshotEqual(current, updated) ? current : updated;
+          const anchored = preserveCommentClickPoint(current, updated);
+          return commentSnapshotEqual(current, anchored) ? current : anchored;
         });
         return;
       }
@@ -12627,16 +12646,16 @@ function HtmlViewer({
           if (existing && commentSnapshotEqual(existing, snapshot)) return current;
           return new Map(current).set(snapshot.elementId, snapshot);
         });
-        setActiveCommentTarget((current) =>
-          current && current.elementId === snapshot.elementId && !commentSnapshotEqual(current, snapshot)
-            ? snapshot
-            : current,
-        );
-        setHoveredCommentTarget((current) =>
-          current && current.elementId === snapshot.elementId && !commentSnapshotEqual(current, snapshot)
-            ? snapshot
-            : current,
-        );
+        setActiveCommentTarget((current) => {
+          if (!current || current.elementId !== snapshot.elementId) return current;
+          const anchored = preserveCommentClickPoint(current, snapshot);
+          return commentSnapshotEqual(current, anchored) ? current : anchored;
+        });
+        setHoveredCommentTarget((current) => {
+          if (!current || current.elementId !== snapshot.elementId) return current;
+          const anchored = preserveCommentClickPoint(current, snapshot);
+          return commentSnapshotEqual(current, anchored) ? current : anchored;
+        });
         return;
       }
       if (data.type === 'od:comment-leave') {
